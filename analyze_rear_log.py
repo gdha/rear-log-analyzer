@@ -124,6 +124,12 @@ BACKUP_METHODS = [
 
 def find_latest_rear_log(log_dir):
     """Find the most recent rear log file."""
+    if not os.path.isdir(log_dir):
+        return None
+    if not os.access(log_dir, os.R_OK | os.X_OK):
+        print(f"[ERROR] Permission denied accessing directory: {log_dir}")
+        print("        Run this script as root (sudo) to access ReaR log files.")
+        sys.exit(1)
     patterns = [
         os.path.join(log_dir, "rear-*.log"),
     ]
@@ -195,21 +201,35 @@ def parse_log_timestamp(line):
 def extract_log_metadata(lines):
     """Extract high-level metadata from the log."""
     meta = {}
-    for line in lines[:20]:
+    for line in lines[:50]:
         m = re.search(r"Relax-and-Recover ([\d.]+\S*)", line)
         if m:
             meta["rear_version"] = m.group(1)
-        m = re.search(r"Running rear (\w+) \(PID (\d+) date ([^)]+)\)", line)
+        # Match both formats:
+        #   "Running rear mkbackup (PID 808122 date 2025-01-15 ...)"  (newer ReaR)
+        #   "Running rear mkbackup (PID 808122)"                      (ReaR 2.6 and older)
+        m = re.search(r"Running rear (\w+) \(PID (\d+)(?: date ([^)]+))?\)", line)
         if m:
             meta["workflow"] = m.group(1)
             meta["pid"] = m.group(2)
-            meta["start_date"] = m.group(3)
-    # Get end status
-    for line in reversed(lines[-10:]):
+            if m.group(3):
+                meta["start_date"] = m.group(3)
+        # Also extract start date from log timestamp if not found above
+        if "start_date" not in meta:
+            m = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})", line)
+            if m:
+                meta["start_date"] = m.group(1)
+    # Get end status — search a broader range as some versions add trailing output
+    for line in reversed(lines[-50:]):
         m = re.search(r"Finished rear (\w+) in (\d+) seconds", line)
         if m:
             meta["finish_workflow"] = m.group(1)
             meta["duration_seconds"] = int(m.group(2))
+            break
+        # Older ReaR format: "Exiting rear mkbackup (PID ...) and target ..."
+        m = re.search(r"Exiting rear (\w+) \(PID", line)
+        if m:
+            meta["finish_workflow"] = m.group(1)
             break
     # Check if ended with error
     for line in reversed(lines[-20:]):
@@ -236,6 +256,13 @@ def find_issues(lines):
                     r"lib.*error|gpg-error|libgpg", line, re.IGNORECASE
                 ):
                     continue
+                # Filter false positive: "unrecognised disk label" from parted.
+                # parted reports this on disks used as whole-disk LVM PVs,
+                # multipath members, or raw devices without partition tables.
+                # This is normal and not an actual error in the ReaR context.
+                if category == "ERROR" and "unrecognised disk label" in line:
+                    ignorable.append((i, "PARTED_NO_LABEL", line.strip()[:200]))
+                    break
                 errors.append((i, category, line.strip()[:200]))
                 break
         else:
@@ -377,8 +404,8 @@ def compare_config(conf_vars, effective, conf_name):
 
     # Check BACKUP_URL consistency
     if "BACKUP_URL" in conf_vars and "BACKUP_URL" in effective:
-        declared = expand_vars(conf_vars["BACKUP_URL"], conf_vars).rstrip("/")
-        actual = effective["BACKUP_URL"].rstrip("/")
+        declared = expand_vars(conf_vars["BACKUP_URL"], conf_vars).rstrip("/;")
+        actual = effective["BACKUP_URL"].rstrip("/;")
         if declared != actual:
             mismatches.append(
                 f"BACKUP_URL: declared='{declared}' vs actual='{actual}'"
@@ -468,9 +495,28 @@ def main():
     else:
         log_path = find_latest_rear_log(REAR_LOG_DIR)
 
-    if not log_path or not os.path.isfile(log_path):
+    if not log_path:
         print(f"[ERROR] No ReaR log file found in {REAR_LOG_DIR}")
         print("        Run with --log /path/to/rear.log to specify manually.")
+        sys.exit(1)
+
+    # Distinguish between "file not found" and "permission denied"
+    try:
+        os.stat(log_path)
+    except PermissionError:
+        print(f"[ERROR] Permission denied accessing: {log_path}")
+        print("        Run this script as root (sudo) to access ReaR log files.")
+        sys.exit(1)
+    except FileNotFoundError:
+        print(f"[ERROR] Log file does not exist: {log_path}")
+        sys.exit(1)
+    except OSError as e:
+        print(f"[ERROR] Cannot access {log_path}: {e}")
+        sys.exit(1)
+
+    if not os.access(log_path, os.R_OK):
+        print(f"[ERROR] Permission denied reading: {log_path}")
+        print("        Run this script as root (sudo) to access ReaR log files.")
         sys.exit(1)
 
     print(f"  Log file: {log_path}")
@@ -486,7 +532,16 @@ def main():
         sys.exit(1)
 
     # --- Metadata ---
+    # --- Metadata ---
     meta = extract_log_metadata(lines)
+
+    # --- Stage timings ---
+    timings = extract_stage_timings(lines)
+
+    # If duration wasn't found in the log, compute it from stage timings
+    if "duration_seconds" not in meta and timings:
+        meta["duration_seconds"] = sum(secs for _, secs in timings)
+
     print("-" * 70)
     print("  RUN SUMMARY")
     print("-" * 70)
@@ -497,8 +552,6 @@ def main():
     print(f"  Completed OK:  {'No' if meta.get('ended_with_error') else 'Yes'}")
     print()
 
-    # --- Stage timings ---
-    timings = extract_stage_timings(lines)
     if timings:
         print("-" * 70)
         print("  STAGE TIMINGS")
@@ -540,7 +593,8 @@ def main():
 
     if ignorable:
         print("-" * 70)
-        print("  SAFELY IGNORABLE (systemd rpath libs per rear#3528; non-ReaR apps)")
+        print("  SAFELY IGNORABLE (systemd rpath libs per rear#3528; non-ReaR apps;")
+        print("                    parted 'unrecognised disk label' on LVM PVs/raw disks)")
         print("-" * 70)
         seen = set()
         for lineno, category, text in ignorable:
