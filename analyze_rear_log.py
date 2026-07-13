@@ -223,6 +223,32 @@ def extract_log_metadata(lines):
     return meta
 
 
+def _is_continuation_line(line):
+    """Check if a line is a continuation of a multi-line error message.
+
+    Continuation lines lack a ReaR timestamp prefix and typically contain
+    indented error/command output (e.g., tar: messages, ---snip--- markers).
+    We must NOT collect normal operational output that happens to lack a
+    timestamp (e.g., cp verbose output, file paths being copied).
+    """
+    # ReaR log lines start with a timestamp: YYYY-MM-DD HH:MM:SS.nnnnnnnnn
+    if re.match(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+", line):
+        return False
+    # Bash trace output (++ or +)
+    if re.match(r"^\+{1,2} ", line):
+        return False
+    # Empty lines are not meaningful continuations
+    if not line.strip():
+        return False
+    # File copy operations (cp verbose output: 'src' -> 'dst' or src -> dst)
+    if " -> " in line and "/" in line:
+        return False
+    # Lines that are just absolute paths (directory listings, file operations)
+    if re.match(r"^['\"]?/", line.strip()):
+        return False
+    return True
+
+
 def find_issues(lines):
     """Find errors and warnings in log lines."""
     errors = []
@@ -237,7 +263,26 @@ def find_issues(lines):
                     r"lib.*error|gpg-error|libgpg", line, re.IGNORECASE
                 ):
                     continue
-                errors.append((i, category, line.strip()[:200]))
+                # modinfo errors about missing modules are harmless (often
+                # built-in to the kernel rather than loadable .ko files)
+                if category == "ERROR" and re.search(
+                    r"modinfo:\s*ERROR:\s*Module\s+\S+\s+not found", line
+                ):
+                    ignorable.append((i, category, line.strip()[:200]))
+                    continue
+                # Capture multi-line error messages: collect continuation lines
+                # that follow (lines without a timestamp prefix)
+                error_text = line.strip()
+                continuation = []
+                for j in range(i, min(i + 30, len(lines))):  # look ahead up to 30 lines
+                    next_line = lines[j]
+                    if _is_continuation_line(next_line):
+                        continuation.append(next_line.rstrip())
+                    else:
+                        break
+                if continuation:
+                    error_text = error_text + "\n" + "\n".join(continuation)
+                errors.append((i, category, error_text))
                 break
         else:
             for pat, category in WARNING_PATTERNS:
@@ -517,7 +562,14 @@ def main():
     print("-" * 70)
     if errors:
         for lineno, category, text in errors:
-            print(f"  L{lineno:<5d} [{category}] {text}")
+            if "\n" in text:
+                # Multi-line error: print first line with label, indent continuation
+                text_lines = text.split("\n")
+                print(f"  L{lineno:<5d} [{category}] {text_lines[0]}")
+                for continuation_line in text_lines[1:]:
+                    print(f"         {continuation_line}")
+            else:
+                print(f"  L{lineno:<5d} [{category}] {text}")
     else:
         print("  None — no hard errors detected.")
     print()
@@ -541,7 +593,7 @@ def main():
 
     if ignorable:
         print("-" * 70)
-        print("  SAFELY IGNORABLE (systemd rpath libs per rear#3528; non-ReaR apps)")
+        print("  SAFELY IGNORABLE (systemd rpath libs per rear#3528; modinfo; non-ReaR apps)")
         print("-" * 70)
         seen = set()
         for lineno, category, text in ignorable:
