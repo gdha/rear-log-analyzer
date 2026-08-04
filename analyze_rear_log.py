@@ -45,6 +45,11 @@ WARNING_PATTERNS = [
     (re.compile(r"No known bootloader matches"), "BOOTLOADER_DETECT"),
 ]
 
+# Python exceptions embedded in ReaR/Borg tracebacks (often indented, no "ERROR" prefix)
+PYTHON_EXCEPTION_RE = re.compile(
+    r"^\s*(?:\w+:\s*)?(?P<exc>[A-Z][A-Za-z]*(?:Error|Exception)):\s*(?P<msg>.+)$"
+)
+
 # Known-safe library warnings that can be ignored
 # See https://github.com/rear/rear/issues/3528 and PRs #3250, #3308
 IGNORABLE_LIB_PATTERNS = [
@@ -223,13 +228,75 @@ def extract_log_metadata(lines):
     return meta
 
 
+def _strip_log_prefix(line):
+    """Remove ReaR timestamp / subsystem prefix for clearer error display."""
+    stripped = line.strip()
+    m = re.match(
+        r"^(?:\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+\s+)?(?:\w+:\s*)?(.*)$",
+        stripped,
+    )
+    return m.group(1).strip() if m else stripped
+
+
+def find_traceback_root_causes(lines, lookback=50):
+    """Find Python exception root causes in traceback blocks."""
+    root_causes = []
+    in_traceback = False
+    traceback_start = None
+
+    for i, line in enumerate(lines, 1):
+        stripped = line.strip()
+        if re.search(r"Traceback \(most recent call last\)", stripped):
+            in_traceback = True
+            traceback_start = i
+            continue
+
+        if in_traceback:
+            m = PYTHON_EXCEPTION_RE.match(line)
+            if m:
+                exc_type = m.group("exc")
+                msg = m.group("msg").strip()
+                root_causes.append(
+                    (i, exc_type, msg, f"{exc_type}: {msg}"[:200])
+                )
+                in_traceback = False
+                continue
+
+            # Traceback ended without a recognized exception line
+            if stripped and not re.match(r"^\s*(File |  File )", line):
+                if re.search(r"\bERROR\b", stripped, re.IGNORECASE):
+                    in_traceback = False
+                elif traceback_start and i - traceback_start > lookback:
+                    in_traceback = False
+
+        # Standalone exception lines outside an active traceback block
+        if not in_traceback:
+            m = PYTHON_EXCEPTION_RE.match(line)
+            if m and not any(rc[0] == i for rc in root_causes):
+                exc_type = m.group("exc")
+                msg = m.group("msg").strip()
+                root_causes.append(
+                    (i, exc_type, msg, f"{exc_type}: {msg}"[:200])
+                )
+
+    return root_causes
+
+
 def find_issues(lines):
     """Find errors and warnings in log lines."""
     errors = []
     warnings = []
     ignorable = []
+    root_causes = find_traceback_root_causes(lines)
+    root_cause_lines = {rc[0] for rc in root_causes}
+
+    for rc in root_causes:
+        errors.append((rc[0], "ROOT_CAUSE", rc[3]))
 
     for i, line in enumerate(lines, 1):
+        if i in root_cause_lines:
+            continue
+
         for pat, category in ERROR_PATTERNS:
             if pat.search(line):
                 # Filter false positives: library names containing "error"
@@ -237,7 +304,9 @@ def find_issues(lines):
                     r"lib.*error|gpg-error|libgpg", line, re.IGNORECASE
                 ):
                     continue
-                errors.append((i, category, line.strip()[:200]))
+
+                text = _strip_log_prefix(line)[:200]
+                errors.append((i, category, text))
                 break
         else:
             for pat, category in WARNING_PATTERNS:
@@ -250,6 +319,7 @@ def find_issues(lines):
                     warnings.append((i, category, line.strip()[:200]))
                     break
 
+    errors.sort(key=lambda item: item[0])
     return errors, warnings, ignorable
 
 
@@ -708,6 +778,21 @@ def main():
     print("  RECOMMENDATIONS")
     print("-" * 70)
     recs = []
+
+    # Borg repository permission errors (often hidden in tracebacks)
+    borg_perm_errors = [
+        e for e in errors
+        if e[1] == "ROOT_CAUSE"
+        and re.search(r"PermissionError.*borg|lock\.roster", e[2], re.IGNORECASE)
+    ]
+    if borg_perm_errors:
+        recs.append(
+            "Borg repository permission error detected (lock.roster or repo path).\n"
+            "      The Borg backup user on the repository server must be able to read\n"
+            "      and write the repository directory and lock files.\n"
+            "      Check ownership/permissions on the repo path and lock.roster on the\n"
+            "      Borg backup server."
+        )
 
     # Hard errors in the log
     if errors:
