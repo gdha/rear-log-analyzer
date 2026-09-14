@@ -18,6 +18,9 @@ from datetime import datetime
 from collections import defaultdict
 
 
+__version__ = "1.0.0"
+
+
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
@@ -238,6 +241,56 @@ def _strip_log_prefix(line):
     return m.group(1).strip() if m else stripped
 
 
+# Diagnostic lines that ReaR logs just *before* aborting with a BugError.
+# These are the actual root cause, whereas the BUG/stack-trace block only
+# points at the ReaR script that detected the problem.
+REAR_ROOT_CAUSE_PATTERNS = [
+    # Broken disklayout entries (e.g. LVM volume group referenced by an
+    # 'lvmdev' line has no matching 'lvmvol' entry) -> 'rear recover' would fail
+    (re.compile(r"LVM no '(?:lvmvol|lvmdev)\b.*"), "DISKLAYOUT_BROKEN"),
+    (re.compile(r"Entries in .*disklayout\.conf are broken"), "DISKLAYOUT_BROKEN"),
+    (re.compile(r"Invalid (?:disklayout|layout) .*entry", re.IGNORECASE),
+     "DISKLAYOUT_BROKEN"),
+]
+
+# ReaR BugError markers (the block that reports where the error was detected)
+REAR_BUGERROR_RE = re.compile(r"BUG in /usr/share/rear/\S+ line \d+")
+
+
+def find_rear_bugerror_root_causes(lines, lookback=25):
+    """Find the real root cause preceding a ReaR BugError/stack-trace block.
+
+    ReaR's stack trace only names the *.sh script that detected a problem
+    (e.g. 950_verify_disklayout_file.sh). The meaningful diagnostic is usually
+    logged in the lines immediately before the ERROR/BUG block. This scans
+    backward from each BugError for a recognized root-cause diagnostic.
+    """
+    root_causes = []
+    seen_lines = set()
+
+    for i, line in enumerate(lines, 1):
+        if not REAR_BUGERROR_RE.search(line):
+            continue
+        # Scan backward from the BugError for the closest diagnostic line.
+        start = max(0, i - 1 - lookback)
+        for j in range(i - 2, start - 1, -1):  # j is 0-based index just above the BUG line
+            prev = lines[j]
+            for pat, category in REAR_ROOT_CAUSE_PATTERNS:
+                if pat.search(prev):
+                    lineno = j + 1
+                    if lineno in seen_lines:
+                        break
+                    seen_lines.add(lineno)
+                    text = _strip_log_prefix(prev)[:200]
+                    root_causes.append((lineno, category, text))
+                    break
+            else:
+                continue
+            break
+
+    return root_causes
+
+
 def find_traceback_root_causes(lines, lookback=50):
     """Find Python exception root causes in traceback blocks."""
     root_causes = []
@@ -318,6 +371,14 @@ def find_issues(lines):
 
     for rc in root_causes:
         errors.append((rc[0], "ROOT_CAUSE", rc[3]))
+
+    # ReaR BugError diagnostics (root cause logged before the BUG/stack trace)
+    rear_root_causes = find_rear_bugerror_root_causes(lines)
+    for lineno, category, text in rear_root_causes:
+        if lineno in root_cause_lines:
+            continue
+        root_cause_lines.add(lineno)
+        errors.append((lineno, "ROOT_CAUSE", f"{category}: {text}"))
 
     for i, line in enumerate(lines, 1):
         if i in root_cause_lines:
@@ -569,6 +630,11 @@ def main():
     parser.add_argument(
         "--log", "-l",
         help="Path to a specific rear log file (default: latest in /var/log/rear)",
+    )
+    parser.add_argument(
+        "--version", "-V",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
     args = parser.parse_args()
 
@@ -843,6 +909,28 @@ def main():
             "      and write the repository directory and lock files.\n"
             "      Check ownership/permissions on the repo path and lock.roster on the\n"
             "      Borg backup server."
+        )
+
+    # Broken disklayout.conf (e.g. LVM lvmdev without matching lvmvol)
+    disklayout_errors = [
+        e for e in errors
+        if e[1] == "ROOT_CAUSE" and "DISKLAYOUT_BROKEN" in e[2]
+    ]
+    if disklayout_errors:
+        recs.append(
+            "Broken /var/lib/rear/layout/disklayout.conf detected — 'rear recover'\n"
+            "      would FAIL, so this backup is NOT usable for recovery.\n"
+            "      A common trigger is an LVM 'lvmdev' entry without a matching\n"
+            "      'lvmvol' entry (e.g. an empty volume group with a PV but no LVs,\n"
+            "      such as 'vg_openv').\n"
+            "      Suggested remediation steps:\n"
+            "        1. Inspect the volume group:  vgs; lvs; pvs\n"
+            "        2. If the VG is intentionally empty (no logical volumes), either\n"
+            "           create the intended LVs or remove the unused VG/PV.\n"
+            "        3. Alternatively exclude the empty VG from the layout, e.g. add\n"
+            "             AUTOEXCLUDE_DISKS=... / a suitable EXCLUDE_* setting\n"
+            "           to /etc/rear/local.conf.\n"
+            "        4. Re-run 'rear -d mkbackup' and confirm the disklayout is valid."
         )
 
     # Hard errors in the log
