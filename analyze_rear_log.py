@@ -399,6 +399,24 @@ def find_issues(lines):
                 ):
                     ignorable.append((i, category, _strip_log_prefix(line)[:200]))
                     continue
+
+                # parted "unrecognised disk label" on raw disks used as LVM
+                # physical volumes (PVs) is a false positive: PVs have no
+                # partition table, so parted cannot recognise a disk label.
+                if category == "ERROR" and re.search(
+                    r"/dev/\S+:\s*unrecognised disk label", line, re.IGNORECASE
+                ):
+                    ignorable.append((i, "DISK_LABEL", _strip_log_prefix(line)[:200]))
+                    continue
+
+                # parted "unrecognised disk label" on raw disks used as LVM
+                # physical volumes (PVs) is a false positive: PVs have no
+                # partition table, so parted cannot recognise a disk label.
+                if category == "ERROR" and re.search(
+                    r"/dev/\S+:\s*unrecognised disk label", line, re.IGNORECASE
+                ):
+                    ignorable.append((i, "DISK_LABEL", _strip_log_prefix(line)[:200]))
+                    continue
                 # Capture multi-line error messages: collect continuation lines
                 # that follow (lines without a timestamp prefix)
                 error_text = _strip_log_prefix(line)
