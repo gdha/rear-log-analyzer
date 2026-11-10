@@ -37,7 +37,22 @@ ERROR_PATTERNS = [
     (re.compile(r"\bFATAL\b", re.IGNORECASE), "FATAL"),
     (re.compile(r"\bABORT", re.IGNORECASE), "ABORT"),
     (re.compile(r"No space left on device", re.IGNORECASE), "NO_SPACE"),
+    # xorriso reports this when the ISO does not fit on the output filesystem.
+    # The line usually says "FAILURE", so it is not caught by the ERROR pattern.
+    # Keep this ahead of the generic xorriso FAILURE pattern.
+    (re.compile(r"exceeds free space", re.IGNORECASE), "NO_SPACE"),
+    (re.compile(r"xorriso\s*:\s*FAILURE\s*:", re.IGNORECASE), "XORRISO_FAILURE"),
 ]
+
+# xorriso sector size for ISO images (2048 bytes). "281340s" means 281340 sectors.
+ISO_SECTOR_BYTES = 2048
+ISO_FREE_SPACE_RE = re.compile(
+    r"Image size\s+(\d+)s\s+exceeds free space(?:\s+on media)?\s+(\d+)s",
+    re.IGNORECASE,
+)
+ISO_CREATE_ERROR_RE = re.compile(r"Could not create ISO image", re.IGNORECASE)
+XORRISO_FAILURE_RE = re.compile(r"xorriso\s*:\s*FAILURE\s*:", re.IGNORECASE)
+LIBISOFS_MISHAP_RE = re.compile(r"libisofs:\s*MISHAP\s*:", re.IGNORECASE)
 
 WARNING_PATTERNS = [
     (re.compile(r"'ldd' shows 'not found'"), "LIBRARY_NOT_FOUND"),
@@ -335,6 +350,66 @@ def find_traceback_root_causes(lines, lookback=50):
     return root_causes
 
 
+def _strip_log_timestamp(text):
+    """Drop a leading ReaR timestamp, leaving the message itself."""
+    return re.sub(
+        r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}\.\d+\s+",
+        "",
+        text.strip(),
+    )
+
+
+def _format_mib(sectors):
+    """Format an ISO sector count as MiB (xorriso uses 2048-byte sectors)."""
+    mib = int(sectors) * ISO_SECTOR_BYTES / (1024 * 1024)
+    if mib < 10:
+        return f"{mib:.1f}"
+    return f"{mib:.0f}"
+
+
+def _annotate_iso_free_space(text):
+    """Append approximate MiB sizes to an xorriso 'exceeds free space' line."""
+    cleaned = _strip_log_timestamp(text)
+    match = ISO_FREE_SPACE_RE.search(cleaned)
+    if not match:
+        return cleaned
+    note = (
+        f"(image ~{_format_mib(match.group(1))} MiB, "
+        f"free ~{_format_mib(match.group(2))} MiB)"
+    )
+    if note in cleaned:
+        return cleaned
+    return f"{cleaned} {note}"
+
+
+def _preceding_iso_tool_failures(lines, error_lineno, lookback=25):
+    """Collect xorriso/libisofs failure lines logged just before a ReaR ERROR.
+
+    ReaR's Error() appends the last program output to the log, then logs
+    'ERROR: Could not create ISO image ...'. The useful diagnostic
+    (xorriso FAILURE / free-space) is therefore above the ERROR line.
+    Those lines may be raw (no timestamp) or normal timestamped log lines.
+    """
+    hits = []
+    start = max(0, error_lineno - 1 - lookback)
+    # Keep scanning timestamped lines. ReaR sometimes logs the xorriso
+    # FAILURE with a timestamp, and sometimes echoes it raw just above
+    # the ERROR line. Either way it sits in this window.
+    for index in range(error_lineno - 2, start - 1, -1):
+        prev = lines[index]
+        if ISO_FREE_SPACE_RE.search(prev) or XORRISO_FAILURE_RE.search(prev):
+            hits.append(_annotate_iso_free_space(prev))
+        elif LIBISOFS_MISHAP_RE.search(prev):
+            hits.append(_strip_log_timestamp(prev))
+    hits.reverse()
+    # The free-space line is also an xorriso FAILURE line; keep one copy.
+    unique = []
+    for hit in hits:
+        if hit not in unique:
+            unique.append(hit)
+    return unique
+
+
 def _is_continuation_line(line):
     """Check if a line is a continuation of a multi-line error message.
 
@@ -418,8 +493,15 @@ def find_issues(lines):
                     ignorable.append((i, "DISK_LABEL", _strip_log_prefix(line)[:200]))
                     continue
                 # Capture multi-line error messages: collect continuation lines
-                # that follow (lines without a timestamp prefix)
-                error_text = _strip_log_prefix(line)
+                # that follow (lines without a timestamp prefix).
+                # Keep the raw xorriso line: _strip_log_prefix() would drop
+                # the leading "xorriso :" token.
+                if category == "NO_SPACE" and ISO_FREE_SPACE_RE.search(line):
+                    error_text = _annotate_iso_free_space(line)
+                elif category == "XORRISO_FAILURE":
+                    error_text = _strip_log_timestamp(line)
+                else:
+                    error_text = _strip_log_prefix(line)
                 continuation = []
                 for j in range(i, min(i + 30, len(lines))):  # look ahead up to 30 lines
                     next_line = lines[j]
@@ -427,6 +509,10 @@ def find_issues(lines):
                         continuation.append(next_line.rstrip())
                     else:
                         break
+                if ISO_CREATE_ERROR_RE.search(error_text):
+                    for cause in _preceding_iso_tool_failures(lines, i):
+                        if cause not in continuation:
+                            continuation.append(cause)
                 if continuation:
                     error_text = error_text + "\n" + "\n".join(continuation)
                 errors.append((i, category, error_text))
@@ -951,6 +1037,38 @@ def main():
             "        4. Re-run 'rear -d mkbackup' and confirm the disklayout is valid."
         )
 
+    # ISO output filesystem too small (xorriso: image exceeds free space)
+    iso_space_errors = [
+        e for e in errors
+        if e[1] == "NO_SPACE" and ISO_FREE_SPACE_RE.search(e[2])
+    ]
+    if iso_space_errors:
+        detail = iso_space_errors[0][2].split("\n", 1)[0].strip()
+        recs.append(
+            "Not enough free space to write the rescue ISO.\n"
+            f"      {detail}\n"
+            "      xorriso counts size in 2048-byte sectors. ReaR creates the ISO\n"
+            "      locally in ISO_DIR (default /var/lib/rear/output) before OUTPUT_URL\n"
+            "      copies it anywhere else, so free space on the backup server does\n"
+            "      not help this failure. The build area (/var/tmp or TMPDIR) can\n"
+            "      still have room when the ISO directory does not.\n"
+            "      Suggested remediation steps:\n"
+            "        1. Check free space:  df -h /var/lib/rear/output /var/tmp /\n"
+            "        2. Free space on that filesystem, or set ISO_DIR in\n"
+            "           /etc/rear/local.conf to a directory on a larger filesystem.\n"
+            "        3. Re-run 'rear mkbackup'."
+        )
+
+    # xorriso failed for a reason other than free space
+    xorriso_errors = [e for e in errors if e[1] == "XORRISO_FAILURE"]
+    if xorriso_errors and not iso_space_errors:
+        detail = xorriso_errors[0][2].split("\n", 1)[0].strip()
+        recs.append(
+            "ISO creation failed inside xorriso. ReaR only reports\n"
+            "      'Could not create ISO image'; the xorriso FAILURE line is the cause:\n"
+            f"      {detail}"
+        )
+
     # Hard errors in the log
     if errors:
         recs.append(
@@ -958,8 +1076,11 @@ def main():
             "      complete successfully. Review the ERROR lines above for details."
         )
 
-    # No space left on device
-    no_space_errors = [e for e in errors if e[1] == "NO_SPACE"]
+    # No space left on device (ENOSPC during build, not the ISO media check)
+    no_space_errors = [
+        e for e in errors
+        if e[1] == "NO_SPACE" and not ISO_FREE_SPACE_RE.search(e[2])
+    ]
     if no_space_errors:
         recs.append(
             "'No space left on device' error detected.\n"
